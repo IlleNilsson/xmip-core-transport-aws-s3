@@ -1,4 +1,4 @@
-# xmip-core-transport-s3
+# xmip-core-transport-aws-s3
 
 Amazon S3 transport: Signature Version 4 over the REST API — list a prefix, get each object and delete it once the runtime accepts it, put a Stream as an object — a bucket prefix is a Location. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 

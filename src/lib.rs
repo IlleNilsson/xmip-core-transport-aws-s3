@@ -31,9 +31,9 @@
 //! answers [`NoNativeClaim`], ADR-0024 clause 5. The native claim the record
 //! names — `PUT` with `If-None-Match: *` on a claim key — is a later step.
 //!
-//! The origin URI is the object in the protocol's own terms:
-//! `s3://bucket/in/order-1.edi`. A send target is the same form, or a key
-//! alone in this transport's bucket.
+//! The origin URI is the object under the scheme that chooses this
+//! technology, its name: `aws-s3://bucket/in/order-1.edi`. A send target is
+//! the same form, or a key alone in this transport's bucket.
 
 pub mod client;
 pub mod session;
@@ -144,7 +144,7 @@ impl S3Transport {
         }
     }
 
-    /// Where a target names the bucket and key itself — `s3://bucket/key`
+    /// Where a target names the bucket and key itself — `aws-s3://bucket/key`
     /// — or is a key alone in this transport's bucket.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
         Target::under(Self::SCHEMES, target).map_or((&self.bucket, target), |named| {
@@ -155,7 +155,7 @@ impl S3Transport {
 
 impl Transport for S3Transport {
     fn name(&self) -> &'static str {
-        "s3"
+        "aws-s3"
     }
 
     fn directions(&self) -> Directions {
@@ -193,7 +193,7 @@ impl Transport for S3Transport {
             || client.list(bucket, &self.prefix),
             most,
             &self.refused,
-            |key| format!("s3://{bucket}/{key}"),
+            |key| format!("aws-s3://{bucket}/{key}"),
             move |key| getting.get(&getting_from, key),
             move |key| deleting.delete(&deleting_from, key),
         )
@@ -256,7 +256,7 @@ impl Configured for S3Transport {
     };
 
     /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["s3"];
+    const SCHEMES: &'static [&'static str] = &["aws-s3"];
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.timeout)
@@ -391,7 +391,7 @@ mod tests {
         // delete; a list to see what is left.
         let far_end = serve(near.session(), listener, 10);
         near.send("in/1.edi", b"UNA:+.? '").expect("a key alone");
-        near.send("s3://orders/in/2.edi", b"")
+        near.send("aws-s3://orders/in/2.edi", b"")
             .expect("a full target");
         near.send("in/3.edi", b"third").expect("a key alone");
         let mut arrived = near.receive().expect("received");
@@ -400,9 +400,9 @@ mod tests {
         assert!(arrived.iter().all(Arrived::defers));
         let third = arrived.pop().expect("third");
         let second = arrived.pop().expect("second");
-        assert_eq!(second.origin_uri, "s3://orders/in/2.edi");
+        assert_eq!(second.origin_uri, "aws-s3://orders/in/2.edi");
         let first = arrived.pop().expect("first").taken().expect("accepted");
-        assert_eq!(first.origin_uri, "s3://orders/in/1.edi");
+        assert_eq!(first.origin_uri, "aws-s3://orders/in/1.edi");
         assert_eq!(first.bytes, b"UNA:+.? '");
         second.failed().expect("left");
         third
@@ -411,7 +411,7 @@ mod tests {
         let again = near.receive().expect("received again");
         assert_eq!(again.len(), 1, "the failed one, not the refused one");
         let again = again.into_iter().next().expect("one").taken().expect("ok");
-        assert_eq!(again.origin_uri, "s3://orders/in/2.edi");
+        assert_eq!(again.origin_uri, "aws-s3://orders/in/2.edi");
         assert_eq!(again.bytes, [] as [u8; 0]);
         let left = near
             .client()
@@ -427,9 +427,12 @@ mod tests {
         assert_eq!(session.objects().len(), 1, "only the refused one is held");
         assert_eq!(
             events[0],
-            Event::Stored(Taken::new("s3://orders/in/1.edi", b"UNA:+.? '".to_vec()))
+            Event::Stored(Taken::new(
+                "aws-s3://orders/in/1.edi",
+                b"UNA:+.? '".to_vec()
+            ))
         );
-        let named = |key: &str| format!("s3://orders/in/{key}");
+        let named = |key: &str| format!("aws-s3://orders/in/{key}");
         assert_matches!(events[3], Event::Listed { .. });
         assert_eq!(
             events[4..6],
@@ -497,7 +500,7 @@ mod tests {
     fn objects_are_artifacts_without_a_lock_and_an_unreachable_endpoint_is_retryable() {
         let near = node("http://127.0.0.1:1", "secret");
         assert!(near.claims().is_some());
-        assert_eq!(near.name(), "s3");
+        assert_eq!(near.name(), "aws-s3");
         assert!(near.directions().receives() && near.directions().sends());
         assert!(near.receive().expect_err("nothing listening").retryable);
         let failure = node("orders.local", "s")
@@ -511,8 +514,8 @@ mod tests {
         let pair = S3Transport::loopback();
         let arrived = pair.round(b"an object").expect("round");
         assert_eq!(arrived.bytes, b"an object");
-        assert_eq!(arrived.origin_uri, "s3://probe/probe.bin");
-        assert_eq!(pair.name(), "s3");
+        assert_eq!(arrived.origin_uri, "aws-s3://probe/probe.bin");
+        assert_eq!(pair.name(), "aws-s3");
         assert_eq!(pair.ceiling(), None);
     }
 
