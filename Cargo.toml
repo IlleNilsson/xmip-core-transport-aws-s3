@@ -2,11 +2,11 @@
 [workspace]
 
 [package]
-name = "xmip-core-transport-s3"
+name = "xmip-core-transport-aws-s3"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/IlleNilsson/xmip-core-transport-s3"
+repository = "https://github.com/IlleNilsson/xmip-core-transport-aws-s3"
 description = "Amazon S3 transport: Signature Version 4 over the REST API — list a prefix, get and delete each object, put a Stream as an object — a bucket prefix is a Location. A xmip-core-transport technology."
 publish = false
 

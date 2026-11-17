@@ -177,11 +177,11 @@ mod tests {
         assert_matches!(&events[2], Event::Listed { prefix, .. } if prefix == "in/");
         assert_eq!(
             events[3],
-            Event::Retrieved("s3://orders/in/a b.edi".to_string())
+            Event::Retrieved("aws-s3://orders/in/a b.edi".to_string())
         );
         assert_eq!(
             events[4],
-            Event::Deleted("s3://orders/in/a b.edi".to_string())
+            Event::Deleted("aws-s3://orders/in/a b.edi".to_string())
         );
         assert_eq!(events[5], Event::Refused("NoSuchKey".to_string()));
     }

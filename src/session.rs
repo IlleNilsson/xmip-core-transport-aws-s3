@@ -176,7 +176,7 @@ impl Session {
 }
 
 fn origin(bucket: &str, key: &str) -> String {
-    format!("s3://{bucket}/{key}")
+    format!("aws-s3://{bucket}/{key}")
 }
 
 /// The `ETag` of the `written`th write, quoted as S3 quotes one.
@@ -208,7 +208,10 @@ mod tests {
         let mut session = Session::new("r", "AKID", "secret");
         let (event, response) = session.answer(&signed(Request::new("PUT", "/b/k").body(b"x")));
         assert_eq!(response.status, 200);
-        assert_eq!(event, Event::Stored(Taken::new("s3://b/k", b"x".to_vec())));
+        assert_eq!(
+            event,
+            Event::Stored(Taken::new("aws-s3://b/k", b"x".to_vec()))
+        );
         assert_eq!(response.header_value("ETag"), Some("\"1\""));
         let (_, response) = session.answer(&signed(Request::new("PUT", "/b/k").body(b"x")));
         assert_eq!(
@@ -225,7 +228,7 @@ mod tests {
         let (event, response) = session.answer(&signed(Request::new("DELETE", "/b/k")));
         assert_eq!(
             (event, response.status),
-            (Event::Deleted("s3://b/k".to_string()), 204)
+            (Event::Deleted("aws-s3://b/k".to_string()), 204)
         );
         assert!(session.objects().is_empty());
         let other = signer("r", "AKID", "wrong")
