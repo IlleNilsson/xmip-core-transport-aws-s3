@@ -15,6 +15,7 @@ use transport::Taken;
 use transport::error::Result;
 
 use crate::client::signer;
+use crate::origin;
 use crate::xml;
 use aws::sigv4::Signer;
 use codec::percent::decode;
@@ -173,10 +174,6 @@ impl Session {
         self.tags.remove(&held);
         (Event::Deleted(origin(bucket, key)), Response::new(204))
     }
-}
-
-fn origin(bucket: &str, key: &str) -> String {
-    format!("aws-s3://{bucket}/{key}")
 }
 
 /// The `ETag` of the `written`th write, quoted as S3 quotes one.

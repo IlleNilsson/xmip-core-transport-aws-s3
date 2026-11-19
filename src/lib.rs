@@ -193,7 +193,7 @@ impl Transport for S3Transport {
             || client.list(bucket, &self.prefix),
             most,
             &self.refused,
-            |key| format!("aws-s3://{bucket}/{key}"),
+            |key| origin(bucket, key),
             move |key| getting.get(&getting_from, key),
             move |key| deleting.delete(&deleting_from, key),
         )
@@ -277,6 +277,15 @@ impl Configured for S3Transport {
         self.connections = self.connections.timed_by(clock);
         self
     }
+}
+
+/// The object `key` in `bucket`, as an origin says it, under the scheme
+/// above: `aws-s3://bucket/key`. The one place the form is written: the
+/// transport's receive, the session's answers and the aws-s3 archive's
+/// receipt all name an object by it.
+#[must_use]
+pub fn origin(bucket: &str, key: &str) -> String {
+    format!("aws-s3://{bucket}/{key}")
 }
 
 impl S3Transport {
