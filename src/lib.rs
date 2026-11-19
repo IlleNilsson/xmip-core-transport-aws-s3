@@ -7,16 +7,18 @@
 //! since speaks its REST API: a bucket, keys under a prefix, four calls. A
 //! Receive Location lists a prefix, gets each object as the runtime first
 //! reads it, and deletes it once the runtime accepts it after the whole
-//! receive cycle — one refused stays where it lies and is not received
-//! again while its `ETag` is unchanged, one whose cycle failed stays for
-//! the next receive; a Send Location puts a Stream as an object.
+//! receive cycle, both held to the `ETag` the listing gave — one refused
+//! stays where it lies and is not received again while its `ETag` is
+//! unchanged, one whose cycle failed stays for the next receive; a Send
+//! Location puts a Stream as an object.
 //! Both are Signature Version 4 over plain HTTP/1.1 on a socket —
 //! `https://` with the `tls` feature, which is the http technology's TLS
 //! (ADR-0033).
 //!
 //! ```text
 //! xml.rs       the listing and the error, picked by hand
-//! client.rs    Xmip's side: list, get, put, delete
+//! client.rs    Xmip's side: list, get, put, delete, each held to a condition
+//!              where one is asked
 //! session.rs   the far end a test or the essentials runs on loopback
 //! ```
 //!
@@ -174,7 +176,11 @@ impl Transport for S3Transport {
     /// one object-store receive: the receive gets and deletes nothing, each
     /// object's `GET` is made when the runtime first reads its body — whole,
     /// `net::http` reads a `GET` body whole — and its acknowledgement
-    /// deletes it on [`transport::Verdict::Accepted`] only. On
+    /// deletes it on [`transport::Verdict::Accepted`] only. Both hold to the
+    /// `ETag` the listing gave (`If-Match`): a body written again since is
+    /// not read, its cycle fails and the next listing takes it as a new
+    /// arrival; an accepted object written again or deleted since is done
+    /// with, and what lies there now stays for the next listing. On
     /// [`transport::Verdict::Refused`] it is left where it lies and this
     /// Location does not receive it again while its `ETag` is unchanged —
     /// one written again is a new arrival; the memory is the node
@@ -194,8 +200,8 @@ impl Transport for S3Transport {
             most,
             &self.refused,
             |key| origin(bucket, key),
-            move |key| getting.get(&getting_from, key),
-            move |key| deleting.delete(&deleting_from, key),
+            move |key, tag| getting.get_as_listed(&getting_from, key, tag),
+            move |key, tag| deleting.delete_as_listed(&deleting_from, key, tag),
         )
     }
 
@@ -484,6 +490,67 @@ mod tests {
         assert_eq!(again.bytes, b"second", "another ETag, a new arrival");
         let (session, _) = far_end.join().expect("thread");
         assert!(session.objects().is_empty(), "accepted, so deleted");
+    }
+
+    /// The bytes an arrival's body reads, and its acknowledgement, which
+    /// the runtime gives only after the cycle.
+    fn read(arrived: Arrived) -> (std::io::Result<Vec<u8>>, transport::Acknowledgement) {
+        let (_, mut body, told) = arrived.into_parts();
+        let mut bytes = Vec::new();
+        let read = std::io::Read::read_to_end(&mut body, &mut bytes).map(|_| bytes);
+        (read, told)
+    }
+
+    #[test]
+    fn a_replacement_between_read_and_acceptance_stays_for_the_next_listing() {
+        let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
+        let near = node(&format!("http://{address}"), "secret");
+        // A put; a list, the get; the put replacing it; the delete of the
+        // one read, which S3 refuses; a list, a get and a delete of the
+        // replacement.
+        let far_end = serve(near.session(), listener, 8);
+        near.send("in/1.edi", b"first").expect("put");
+        let listed = near.receive().expect("listed").remove(0);
+        let (read, told) = read(listed);
+        assert_eq!(read.expect("read"), b"first");
+        near.send("in/1.edi", b"second").expect("replaced");
+        told.acknowledge(transport::Verdict::Accepted)
+            .expect("the one read is done with: the replacement is not it");
+        let again = near.receive().expect("listed again");
+        assert_eq!(again.len(), 1, "the replacement stayed in the bucket");
+        let again = again.into_iter().next().expect("one").taken().expect("ok");
+        assert_eq!(again.bytes, b"second");
+        let (session, events) = far_end.join().expect("thread");
+        assert!(session.objects().is_empty(), "the replacement, accepted");
+        assert_eq!(
+            events[4],
+            Event::Refused("PreconditionFailed".to_string()),
+            "the delete held to the ETag listed"
+        );
+    }
+
+    #[test]
+    fn a_replacement_between_listing_and_first_read_is_not_read_under_the_old_stamp() {
+        let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
+        let near = node(&format!("http://{address}"), "secret");
+        // A put; a list; the put replacing it; the get under the old ETag,
+        // which S3 refuses; a list, a get and a delete of the replacement.
+        let far_end = serve(near.session(), listener, 7);
+        near.send("in/1.edi", b"first").expect("put");
+        let listed = near.receive().expect("listed").remove(0);
+        near.send("in/1.edi", b"second").expect("replaced");
+        let unread = listed.taken().expect_err("not read under the old ETag");
+        assert!(
+            unread.message.contains("changed since it was listed"),
+            "{unread}"
+        );
+        let again = near.receive().expect("listed again");
+        assert_eq!(again.len(), 1, "the failed read deleted nothing");
+        let again = again.into_iter().next().expect("one").taken().expect("ok");
+        assert_eq!(again.bytes, b"second", "read under its own ETag");
+        let (session, events) = far_end.join().expect("thread");
+        assert!(session.objects().is_empty(), "the replacement, accepted");
+        assert_eq!(events[3], Event::Refused("PreconditionFailed".to_string()));
     }
 
     #[test]
