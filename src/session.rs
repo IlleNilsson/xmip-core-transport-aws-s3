@@ -3,9 +3,12 @@
 //!
 //! Not S3. One session holds objects in memory, verifies every request
 //! against one credential, and answers the four calls with the shapes S3
-//! answers them — the listing, the object, the error with its code. A
-//! Location that needs durability, versions or a second credential talks
-//! to a store through [`crate::Client`].
+//! answers them — the listing, the object, the error with its code — and
+//! holds a `GET` or `DELETE` to its `If-Match` and a `PUT` to its
+//! `If-None-Match: *` as S3 does: 404 where a held request finds no
+//! object, 412 where the condition does not hold. A Location that needs
+//! durability, versions or a second credential talks to a store through
+//! [`crate::Client`].
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -106,6 +109,10 @@ impl Session {
         if bucket.is_empty() {
             return refused(400, "InvalidRequest", "a request naming no bucket");
         }
+        let held = format!("{bucket}/{key}");
+        if let Some(unmet) = self.unmet(&held, request) {
+            return unmet;
+        }
         match (request.method.as_str(), key.is_empty()) {
             ("GET", true) => self.list(bucket, request),
             ("GET", false) => self.get(bucket, key),
@@ -113,6 +120,22 @@ impl Session {
             ("DELETE", false) => self.delete(bucket, key),
             _ => refused(405, "MethodNotAllowed", "not one of the four calls"),
         }
+    }
+
+    /// The refusal S3 answers where `request`'s condition on `held` does not
+    /// hold: `If-Match` on an object that is not there, 404, or that bears
+    /// another `ETag`, 412; `If-None-Match: *` on one that is there, 412.
+    fn unmet(&self, held: &str, request: &Request) -> Option<(Event, Response)> {
+        let tag = self.tags.get(held).map(|written| etag(*written));
+        if let Some(wanted) = request.header_value("If-Match") {
+            return match tag {
+                None => Some(no_such_key()),
+                Some(tag) if tag != wanted => Some(precondition_failed()),
+                Some(_) => None,
+            };
+        }
+        (request.header_value("If-None-Match") == Some("*") && tag.is_some())
+            .then(precondition_failed)
     }
 
     fn list(&self, bucket: &str, request: &Request) -> (Event, Response) {
@@ -147,7 +170,7 @@ impl Session {
                     .header("Content-Type", "application/octet-stream")
                     .body(bytes),
             ),
-            None => refused(404, "NoSuchKey", "The specified key does not exist."),
+            None => no_such_key(),
         }
     }
 
@@ -179,6 +202,18 @@ impl Session {
 /// The `ETag` of the `written`th write, quoted as S3 quotes one.
 fn etag(written: u64) -> String {
     format!("\"{written}\"")
+}
+
+fn no_such_key() -> (Event, Response) {
+    refused(404, "NoSuchKey", "The specified key does not exist.")
+}
+
+fn precondition_failed() -> (Event, Response) {
+    refused(
+        412,
+        "PreconditionFailed",
+        "At least one of the pre-conditions you specified did not hold",
+    )
 }
 
 fn refused(status: u16, code: &str, message: &str) -> (Event, Response) {
@@ -237,5 +272,37 @@ mod tests {
         assert_eq!(response.status, 400);
         let (_, response) = session.answer(&signed(Request::new("POST", "/b/k")));
         assert_eq!(response.status, 405);
+    }
+
+    #[test]
+    fn a_session_holds_a_request_to_its_condition_as_s3_does() {
+        let mut session = Session::new("r", "AKID", "secret");
+        let held = |method: &str, header: &str, value: &str| {
+            signed(Request::new(method, "/b/k").header(header, value))
+        };
+        let (event, response) = session.answer(&held("GET", "If-Match", "\"1\""));
+        assert_eq!(
+            (event, response.status),
+            (Event::Refused("NoSuchKey".into()), 404)
+        );
+        let (_, response) = session.answer(&held("DELETE", "If-Match", "\"1\""));
+        assert_eq!(response.status, 404, "nothing there to hold to");
+        let (_, response) = session.answer(&held("PUT", "If-None-Match", "*"));
+        assert_eq!(response.status, 200, "nothing there, so stored");
+        let (event, response) = session.answer(&held("PUT", "If-None-Match", "*"));
+        let failed = (Event::Refused("PreconditionFailed".into()), 412);
+        assert_eq!((event, response.status), failed, "there already");
+        let (_, response) = session.answer(&held("GET", "If-Match", "\"2\""));
+        assert_eq!(response.status, 412, "another ETag");
+        let (_, response) = session.answer(&held("DELETE", "If-Match", "\"2\""));
+        assert_eq!(response.status, 412, "another ETag");
+        let (_, response) = session.answer(&held("GET", "If-Match", "\"1\""));
+        assert_eq!(response.body, b"", "the one stored, read as listed");
+        let (event, response) = session.answer(&held("DELETE", "If-Match", "\"1\""));
+        assert_eq!(
+            (event, response.status),
+            (Event::Deleted("aws-s3://b/k".into()), 204)
+        );
+        assert!(session.objects().is_empty());
     }
 }
