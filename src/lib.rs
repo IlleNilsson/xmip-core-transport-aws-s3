@@ -19,6 +19,7 @@
 //! xml.rs       the listing and the error, picked by hand
 //! client.rs    Xmip's side: list, get, put, delete, each held to a condition
 //!              where one is asked
+//! bucket.rs    the bucket as the capability's receive and claim reach it
 //! session.rs   the far end a test or the essentials runs on loopback
 //! ```
 //!
@@ -29,33 +30,42 @@
 //! the http technology until the owner's ruling of 2026-09-22: what AWS
 //! speaks is the AWS crate's to share.
 //!
-//! S3 has objects and no lock this transport takes, so [`Transport::claims`]
-//! answers [`NoNativeClaim`], ADR-0024 clause 5. The native claim the record
-//! names — `PUT` with `If-None-Match: *` on a claim key — is a later step.
+//! **One node receives an object** (ADR-0024, amendment 2026-11-20): a
+//! receive claims each object it hands over by putting `<key>.xmip-claim`
+//! beside it with `If-None-Match: *`, which S3 stores only where no object
+//! of the key exists, `412 Precondition Failed` otherwise — the capability's
+//! claim, written once (`transport::listed::Claims`). The claim holds the
+//! node's location and the time; it is deleted as it was put however the
+//! cycle ends, and a node that starts again deletes every claim its name
+//! still holds. [`Transport::claims`] answers the same claim for one object
+//! by its address. On an S3-compatible endpoint that ignores
+//! `If-None-Match: *` every claim's put succeeds, so two nodes may both
+//! receive one object there: twice, never lost (open problem 75).
 //!
 //! The origin URI is the object under the scheme that chooses this
 //! technology, its name: `aws-s3://bucket/in/order-1.edi`. A send target is
 //! the same form, or a key alone in this transport's bucket.
 
+pub mod bucket;
 pub mod client;
 pub mod session;
 pub mod xml;
 
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::time::Duration;
 
 pub use client::Client;
 use http::endpoint::Connections;
 use net::{Endpoint, Target};
 pub use session::{Event, Session};
-use transport::ArrivalIdentity;
+use transport::claim::Claimant;
 use transport::error::{Result, protocol_error};
-use transport::listed::listed;
+use transport::listed::Claims;
 use transport::listening::Listening;
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, NoNativeClaim, ResourceClaim, Transport};
+use transport::{ArrivalIdentity, NodeLocation};
+use transport::{Arrived, Configured, Directions, ResourceClaim, Transport};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 /// What the loopback pair agrees on: one bucket, one object put there, one
@@ -79,9 +89,9 @@ pub struct S3Transport {
     /// The connections kept to the service, shared by every client this
     /// makes.
     connections: Connections,
-    /// The objects this Location refused and left in the bucket, each with
-    /// its `ETag`; a clone shares them.
-    refused: transport::Refused<String, String>,
+    /// The claims this Location makes, and the objects it refused and left
+    /// in the bucket, each with its `ETag`; a clone shares them.
+    claims: Claims,
 }
 
 impl S3Transport {
@@ -98,7 +108,7 @@ impl S3Transport {
             prefix: String::new(),
             timeout: None,
             connections: Connections::new(),
-            refused: transport::Refused::default(),
+            claims: Claims::new(Claimant::process()),
         }
     }
 
@@ -172,9 +182,12 @@ impl Transport for S3Transport {
         transport::Waiting::Polled("a receive lists the bucket and returns")
     }
 
-    /// Every object under the prefix, listed by [`listed`], the capability's
-    /// one object-store receive: the receive gets and deletes nothing, each
-    /// object's `GET` is made when the runtime first reads its body — whole,
+    /// Every object under the prefix that this node's claim wins, listed
+    /// by the capability's one object-store receive
+    /// ([`transport::listed::Claims::listed`]): each claimed by a put of
+    /// its claim with `If-None-Match: *`, one passed over where another's
+    /// claim lies. The receive gets and deletes nothing, each object's
+    /// `GET` is made when the runtime first reads its body — whole,
     /// `net::http` reads a `GET` body whole — and its acknowledgement
     /// deletes it on [`transport::Verdict::Accepted`] only. Both hold to the
     /// `ETag` the listing gave (`If-Match`): a body written again since is
@@ -186,23 +199,9 @@ impl Transport for S3Transport {
     /// one written again is a new arrival; the memory is the node
     /// process's, so a node started again receives it once more. On
     /// [`transport::Verdict::Failed`] it is left for the next receive to
-    /// list and get again.
+    /// list and get again. Whatever the verdict, its claim is deleted.
     fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
-        let client = Arc::new(self.client()?);
-        let (getting, deleting) = (Arc::clone(&client), Arc::clone(&client));
-        let (bucket, getting_from, deleting_from) = (
-            self.bucket.as_str(),
-            self.bucket.clone(),
-            self.bucket.clone(),
-        );
-        listed(
-            || client.list(bucket, &self.prefix),
-            most,
-            &self.refused,
-            |key| origin(bucket, key),
-            move |key, tag| getting.get_as_listed(&getting_from, key, tag),
-            move |key, tag| deleting.delete_as_listed(&deleting_from, key, tag),
-        )
+        self.claims.listed(&self.bucket()?, most)
     }
 
     fn sending(&self) -> transport::Sending {
@@ -218,7 +217,7 @@ impl Transport for S3Transport {
     }
 
     fn claims(&self) -> Option<&dyn ResourceClaim> {
-        Some(&NoNativeClaim)
+        Some(self)
     }
 }
 
@@ -282,6 +281,14 @@ impl Configured for S3Transport {
     fn timed_by(mut self, clock: &std::sync::Arc<dyn xcore::Clock>) -> Self {
         self.connections = self.connections.timed_by(clock);
         self
+    }
+
+    /// Claims made in `node`'s name from here on; every claim that name
+    /// still holds in the bucket is deleted by the first receive that
+    /// reaches it (ADR-0024, amendment 2026-11-20).
+    fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
+        self.claims = Claims::recovering(Claimant::of(node));
+        Ok(self)
     }
 }
 
@@ -402,9 +409,10 @@ mod tests {
     fn an_object_is_got_when_read_deleted_when_accepted_and_left_when_refused_or_failed() {
         let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
         let near = node(&format!("http://{address}"), "secret");
-        // Three puts; a list, the one get read, its delete; a list, a get, a
-        // delete; a list to see what is left.
-        let far_end = serve(near.session(), listener, 10);
+        // Three puts; a list, three claims, the one get read, its delete,
+        // its claim's, the other two claims'; a list, a claim, a get, a
+        // delete, its claim's; a list to see what is left.
+        let far_end = serve(near.session(), listener, 18);
         near.send("in/1.edi", b"UNA:+.? '").expect("a key alone");
         near.send("aws-s3://orders/in/2.edi", b"")
             .expect("a full target");
@@ -449,31 +457,72 @@ mod tests {
         );
         let named = |key: &str| format!("aws-s3://orders/in/{key}");
         assert_matches!(events[3], Event::Listed { .. });
+        assert_matches!(
+            &events[4],
+            Event::Stored(claim) if claim.origin_uri == named("1.edi.xmip-claim"),
+            "claimed beside it"
+        );
         assert_eq!(
-            events[4..6],
+            events[7..12],
             [
                 Event::Retrieved(named("1.edi")),
-                Event::Deleted(named("1.edi"))
+                Event::Deleted(named("1.edi")),
+                Event::Deleted(named("1.edi.xmip-claim")),
+                Event::Deleted(named("2.edi.xmip-claim")),
+                Event::Deleted(named("3.edi.xmip-claim"))
             ],
-            "only what was read was got, only what was accepted deleted"
+            "only what was read was got, only what was accepted deleted, every claim let go"
         );
-        assert_matches!(events[6], Event::Listed { .. });
+        assert_matches!(events[12], Event::Listed { .. });
         assert_eq!(
-            events[7..9],
+            events[14..17],
             [
                 Event::Retrieved(named("2.edi")),
-                Event::Deleted(named("2.edi"))
+                Event::Deleted(named("2.edi")),
+                Event::Deleted(named("2.edi.xmip-claim"))
             ]
         );
-        assert_matches!(events[9], Event::Listed { .. });
+        assert_matches!(events[17], Event::Listed { .. });
+    }
+
+    #[test]
+    fn two_nodes_listing_one_bucket_never_both_receive_one_object() {
+        let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
+        let on = |place: &str| {
+            let location =
+                NodeLocation::new(format!("process-{}/place-{place}", std::process::id()));
+            node(&format!("http://{address}"), "secret")
+                .on_node(&location)
+                .expect("on its node")
+        };
+        let (first, second) = (on("first"), on("second"));
+        // A put; the first's list and claim; the second's list, and its
+        // read of the claim it finds as it starts; the first's get, delete
+        // and its claim's; the second's list.
+        let far_end = serve(first.session(), listener, 9);
+        first.send("in/1.edi", b"once").expect("put");
+        let won = first.receive().expect("listed");
+        assert!(second.receive().expect("listed").is_empty(), "held");
+        let taken = won.into_iter().next().expect("won").taken().expect("ok");
+        assert_eq!(taken.bytes, b"once");
+        assert!(second.receive().expect("listed").is_empty(), "gone");
+        let (session, events) = far_end.join().expect("thread");
+        assert!(session.objects().is_empty(), "the object and its claim");
+        let claim = "aws-s3://orders/in/1.edi.xmip-claim".to_string();
+        assert_eq!(
+            events[4],
+            Event::Retrieved(claim),
+            "another node's, and left"
+        );
     }
 
     #[test]
     fn a_refused_object_is_not_received_again_until_it_is_written_again() {
         let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
         let near = node(&format!("http://{address}"), "secret");
-        // A put; a list; a list; a put again; a list, a get, a delete.
-        let far_end = serve(near.session(), listener, 7);
+        // A put; a list, a claim, its delete; a list; a put again; a list,
+        // a claim, a get, a delete, its claim's.
+        let far_end = serve(near.session(), listener, 11);
         near.send("in/1.edi", b"first").expect("put");
         let refused = near.receive().expect("received").remove(0);
         refused
@@ -505,10 +554,10 @@ mod tests {
     fn a_replacement_between_read_and_acceptance_stays_for_the_next_listing() {
         let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
         let near = node(&format!("http://{address}"), "secret");
-        // A put; a list, the get; the put replacing it; the delete of the
-        // one read, which S3 refuses; a list, a get and a delete of the
-        // replacement.
-        let far_end = serve(near.session(), listener, 8);
+        // A put; a list, a claim, the get; the put replacing it; the delete
+        // of the one read, which S3 refuses, and its claim's; a list, a
+        // claim, a get, a delete and its claim's of the replacement.
+        let far_end = serve(near.session(), listener, 12);
         near.send("in/1.edi", b"first").expect("put");
         let listed = near.receive().expect("listed").remove(0);
         let (read, told) = read(listed);
@@ -523,7 +572,7 @@ mod tests {
         let (session, events) = far_end.join().expect("thread");
         assert!(session.objects().is_empty(), "the replacement, accepted");
         assert_eq!(
-            events[4],
+            events[5],
             Event::Refused("PreconditionFailed".to_string()),
             "the delete held to the ETag listed"
         );
@@ -533,9 +582,10 @@ mod tests {
     fn a_replacement_between_listing_and_first_read_is_not_read_under_the_old_stamp() {
         let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
         let near = node(&format!("http://{address}"), "secret");
-        // A put; a list; the put replacing it; the get under the old ETag,
-        // which S3 refuses; a list, a get and a delete of the replacement.
-        let far_end = serve(near.session(), listener, 7);
+        // A put; a list, a claim; the put replacing it; the get under the
+        // old ETag, which S3 refuses, and its claim's delete; a list, a
+        // claim, a get, a delete and its claim's of the replacement.
+        let far_end = serve(near.session(), listener, 11);
         near.send("in/1.edi", b"first").expect("put");
         let listed = near.receive().expect("listed").remove(0);
         near.send("in/1.edi", b"second").expect("replaced");
@@ -550,7 +600,7 @@ mod tests {
         assert_eq!(again.bytes, b"second", "read under its own ETag");
         let (session, events) = far_end.join().expect("thread");
         assert!(session.objects().is_empty(), "the replacement, accepted");
-        assert_eq!(events[3], Event::Refused("PreconditionFailed".to_string()));
+        assert_eq!(events[4], Event::Refused("PreconditionFailed".to_string()));
     }
 
     #[test]
@@ -573,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn objects_are_artifacts_without_a_lock_and_an_unreachable_endpoint_is_retryable() {
+    fn objects_are_claimed_artifacts_and_an_unreachable_endpoint_is_retryable() {
         let near = node("http://127.0.0.1:1", "secret");
         assert!(near.claims().is_some());
         assert_eq!(near.name(), "aws-s3");

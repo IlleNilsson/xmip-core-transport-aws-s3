@@ -7,9 +7,9 @@
 //! with the bucket moved into the host.
 //!
 //! A receive's get and delete hold to the `ETag` the listing gave
-//! (`If-Match`), and an archive's put writes only where nothing is
-//! (`If-None-Match: *`), so neither reads, deletes nor writes over an
-//! object written since. What S3 answers a condition is read from the
+//! (`If-Match`), and a receive's claim and an archive's put write only
+//! where nothing is (`If-None-Match: *`), so none reads, deletes nor
+//! writes over an object written since. What S3 answers a condition is read from the
 //! status before the answer is judged: AWS, *`GetObject`*, *`DeleteObject`*
 //! and *`PutObject`* (docs.aws.amazon.com/AmazonS3/latest/API/
 //! `API_GetObject.html`, `API_DeleteObject.html`, `API_PutObject.html`), and
@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
 use transport::listed::AsListed;
 
 use aws::sigv4::{self, Signer};
@@ -145,17 +145,18 @@ impl Client {
     }
 
     /// Store `bytes` as the object at `key` in `bucket` where no object is
-    /// there, and say whether it was stored: `PUT` with `If-None-Match: *`,
-    /// which S3 answers 412 where an object is there already, and nothing
-    /// is written over (`API_PutObject.html`). A 409
-    /// `ConditionalRequestConflict` is a write that completed while this
-    /// one was being judged; AWS says retry the upload, and it is retried
-    /// once, against what that write left. A second 409 is a failure worth
-    /// repeating.
+    /// there: the `ETag` it was stored with, or `None` where one was there
+    /// — `PUT` with `If-None-Match: *`, which S3 answers 412 where an
+    /// object is there already, and nothing is written over
+    /// (`API_PutObject.html`). A 409 `ConditionalRequestConflict` is a
+    /// write that completed while this one was being judged; AWS says retry
+    /// the upload, and it is retried once, against what that write left. A
+    /// second 409 is a failure worth repeating.
     ///
     /// # Errors
-    /// Where the endpoint refused or could not be reached.
-    pub fn put_new(&self, bucket: &str, key: &str, bytes: &[u8]) -> Result<bool> {
+    /// Where the endpoint refused or could not be reached, or stored it
+    /// without saying its `ETag`.
+    pub fn put_new(&self, bucket: &str, key: &str, bytes: &[u8]) -> Result<Option<String>> {
         let new = || stored(bucket, key, bytes).header("If-None-Match", "*");
         let answer = self.answer(new())?;
         let answer = if answer.status == CONFLICT {
@@ -215,13 +216,16 @@ fn as_listed(answer: Response, changed: &[u16]) -> Result<AsListed<Response>> {
     judge(answer).map(AsListed::Held)
 }
 
-/// Whether a `PUT` with `If-None-Match: *` stored its object: not where
-/// one was there already, otherwise judged.
-fn created(answer: Response) -> Result<bool> {
+/// The `ETag` a `PUT` with `If-None-Match: *` stored its object with:
+/// none where one was there already, otherwise judged.
+fn created(answer: Response) -> Result<Option<String>> {
     if answer.status == PRECONDITION_FAILED {
-        return Ok(false);
+        return Ok(None);
     }
-    judge(answer).map(|_| true)
+    let stored = judge(answer)?;
+    let etag = stored.header_value("ETag").map(str::to_string);
+    etag.map(Some)
+        .ok_or_else(|| protocol_error("S3 stored an object without saying its ETag"))
 }
 
 /// A 2xx answer as it is; anything else as a failure naming the status and
@@ -326,10 +330,12 @@ mod tests {
         assert_eq!(read.expect("get"), None, "written again");
         let deleted = held(client.delete_as_listed("orders", "in/a.edi", stale));
         assert_eq!(deleted.expect("delete"), None, "written again");
-        assert!(!client.put_new("orders", "in/a.edi", b"third").expect("put"));
+        let there = client.put_new("orders", "in/a.edi", b"third");
+        assert_eq!(there.expect("put"), None, "one is there");
         let read = held(client.get_as_listed("orders", "in/none.edi", stale));
         assert_eq!(read.expect("get"), None, "gone");
-        assert!(client.put_new("orders", "in/b.edi", b"new").expect("put"));
+        let stored = client.put_new("orders", "in/b.edi", b"new");
+        assert_eq!(stored.expect("put").as_deref(), Some("\"3\""), "its ETag");
         let (session, events) = far_end.join().expect("thread");
         assert_eq!(
             session.objects().get("orders/in/a.edi"),
@@ -364,8 +370,10 @@ mod tests {
         assert_eq!(delete(204).expect("204"), Some(204));
         assert!(delete(503).expect_err("server").retryable);
         assert!(!delete(403).expect_err("forbidden").retryable);
-        assert_matches!(created(Response::new(412)), Ok(false));
-        assert_matches!(created(Response::new(200)), Ok(true));
+        assert_matches!(created(Response::new(412)), Ok(None));
+        let stored = created(Response::new(200).header("ETag", "\"7\""));
+        assert_eq!(stored.expect("stored").as_deref(), Some("\"7\""));
+        assert!(created(Response::new(200)).is_err(), "stored, ETag unsaid");
         let conflict =
             Response::new(409).body(crate::xml::error("ConditionalRequestConflict", "").as_bytes());
         let failure = created(conflict).expect_err("conflict");
@@ -388,7 +396,7 @@ mod tests {
                         let answer = if status == 409 {
                             answer.body(conflict.as_bytes())
                         } else {
-                            answer
+                            answer.header("ETag", "\"1\"")
                         };
                         (r.header_value("If-None-Match").map(str::to_string), answer)
                     },
@@ -399,7 +407,8 @@ mod tests {
         let client = Client::new(&format!("http://{address}"), "eu-north-1", "AKID", "secret")
             .expect("endpoint")
             .timing_out_after(Duration::from_secs(2));
-        assert!(client.put_new("orders", "a.edi", b"x").expect("stored"));
+        let stored = client.put_new("orders", "a.edi", b"x").expect("stored");
+        assert_eq!(stored.as_deref(), Some("\"1\""));
         let conditions = far_end.join().expect("thread");
         assert_eq!(conditions, [Some("*".to_string()), Some("*".to_string())]);
     }
