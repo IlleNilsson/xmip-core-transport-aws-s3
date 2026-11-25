@@ -92,6 +92,10 @@ pub struct S3Transport {
     /// The claims this Location makes, and the objects it refused and left
     /// in the bucket, each with its `ETag`; a clone shares them.
     claims: Claims,
+    /// The secret a Location names, the secret access key its requests are
+    /// signed with, read at each request (ADR-0019, amendment 2026-10-29;
+    /// ADR-0015, amendment 2026-11-25); `secret_key` where it names none.
+    secret: Option<transport::Secured>,
 }
 
 impl S3Transport {
@@ -109,6 +113,7 @@ impl S3Transport {
             timeout: None,
             connections: Connections::new(),
             claims: Claims::new(Claimant::process()),
+            secret: None,
         }
     }
 
@@ -127,17 +132,17 @@ impl S3Transport {
         self
     }
 
-    /// The client this transport speaks through.
+    /// The client this transport speaks through, signing with the secret
+    /// the Location names as it is set now.
     ///
     /// # Errors
-    /// Where the endpoint is not an HTTP URL.
+    /// Where the endpoint is not an HTTP URL, or the Location's secret is
+    /// not set, cannot be read or is no password
+    /// (`transport::secured::presented`).
     pub fn client(&self) -> Result<Client> {
-        let client = Client::new(
-            &self.endpoint,
-            &self.region,
-            &self.access_key,
-            &self.secret_key,
-        )?;
+        let secret_key =
+            transport::secured::presented(self.secret.as_ref(), &self.secret_key, "aws-s3")?;
+        let client = Client::new(&self.endpoint, &self.region, &self.access_key, &secret_key)?;
         let client = client.sharing(self.connections.clone());
         Ok(match self.timeout {
             Some(timeout) => client.timing_out_after(timeout),
@@ -223,8 +228,8 @@ impl Transport for S3Transport {
 
 impl Configured for S3Transport {
     /// The address is the S3 endpoint, `https://s3.<region>.amazonaws.com`.
-    /// The access key and its secret are the Location's credentials, not
-    /// settings: a secret never is.
+    /// The access key ID is `access_key_id`; its secret access key is the
+    /// Location's `secret`, never a setting.
     const SETTINGS: &'static Settings = &Settings {
         technology: env!("CARGO_PKG_NAME"),
         settings: &[
@@ -235,6 +240,7 @@ impl Configured for S3Transport {
                 meaning: "The AWS region requests are signed for, eu-north-1.",
                 applies: Applies::Both,
             },
+            aws::access_key::ACCESS_KEY_ID,
             Setting {
                 name: "bucket",
                 kind: Kind::Text,
@@ -268,12 +274,23 @@ impl Configured for S3Transport {
     }
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
-        // The access key and secret come through the Location's credentials.
+        // The secret access key comes through the Location's secret.
         let mut transport = Self::new(address, settings.text("region"), settings.text("bucket"));
+        if let Some(access_key) = settings.optional_text(aws::access_key::ACCESS_KEY_ID.name) {
+            transport.access_key = access_key.to_string();
+        }
         if let Some(prefix) = settings.optional_text("prefix") {
             transport = transport.with_prefix(prefix);
         }
         Ok(transport)
+    }
+
+    /// The secret access key the Location's secret holds, signed with at
+    /// each request as its `access_key_id`; refused where it names none.
+    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
+        let secret = aws::access_key::signing_as(&self.access_key, secret)?;
+        self.secret = Some(secret);
+        Ok(self)
     }
 
     /// The connections its clients share, an HTTP/2 one's frames in a span
@@ -682,5 +699,56 @@ mod tests {
             let arrived = pair.round(&payload).expect(name);
             assert_eq!(arrived.bytes, payload, "{name}");
         }
+    }
+
+    /// A Location signs as its `access_key_id` with the secret access key
+    /// the secret it names holds, read at each request (ADR-0015, amendment
+    /// 2026-11-25).
+    #[test]
+    fn a_location_signs_with_the_secret_it_names_as_its_access_key_id() {
+        use std::sync::Arc;
+        use transport::secured::Kept;
+        use xcore::settings::Given;
+        let drawn = Kept::drawn();
+        let (listener, address) = socket::bind_tcp("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{address}");
+        let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+        let given = [
+            text("region", "eu-north-1"),
+            text("bucket", "orders"),
+            text("access_key_id", "AKIDPROBE"),
+        ];
+        let kept = Arc::new(Kept::default());
+        let near = S3Transport::open(&endpoint, Applies::Send, &given)
+            .expect("built")
+            .timing_out_after(Duration::from_secs(2))
+            .secured_by(kept.secured("partner-x.s3"))
+            .expect("presents its secret");
+        let unset = near.send("in/1.edi", b"UNA").expect_err("not set");
+        assert!(
+            unset.retryable && unset.message.contains("is not set"),
+            "{unset}"
+        );
+
+        kept.set("partner-x.s3", xcore::SecretKind::Password, &drawn);
+        let far = Session::new("eu-north-1", "AKIDPROBE", &drawn);
+        let far_end = serve(far.timing_out_after(Duration::from_secs(2)), listener, 1);
+        near.send("in/1.edi", b"UNA")
+            .expect("signed with the secret");
+        let (_, events) = far_end.join().expect("thread");
+        assert_eq!(
+            events,
+            [Event::Stored(Taken::new(
+                "aws-s3://orders/in/1.edi",
+                b"UNA".to_vec()
+            ))]
+        );
+
+        let unnamed = S3Transport::open(&endpoint, Applies::Send, &given[..2]).expect("built");
+        let Err(refused) = unnamed.secured_by(kept.secured("partner-x.s3")) else {
+            panic!("no access key ID to sign as");
+        };
+        assert!(!refused.retryable);
+        assert!(refused.message.contains("\"access_key_id\""), "{refused}");
     }
 }
