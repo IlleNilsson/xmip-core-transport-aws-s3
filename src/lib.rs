@@ -45,38 +45,64 @@
 //! The origin URI is the object under the scheme that chooses this
 //! technology, its name: `aws-s3://bucket/in/order-1.edi`. A send target is
 //! the same form, or a key alone in this transport's bucket.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod bucket;
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod session;
+#[cfg(feature = "default")]
 pub mod xml;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use client::Client;
+#[cfg(feature = "default")]
 use http::endpoint::Connections;
+#[cfg(feature = "default")]
 use net::{Endpoint, Target};
+#[cfg(feature = "default")]
 pub use session::{Event, Session};
-use transport::claim::Claimant;
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
-use transport::listed::Claims;
-use transport::listening::Listening;
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
-use transport::{ArrivalIdentity, NodeStart};
+#[cfg(feature = "default")]
+use transport::{ArrivalIdentity, NodeStart, claim::Claimant, listed::Claims};
+#[cfg(feature = "default")]
 use transport::{Arrived, Configured, Directions, ResourceClaim, Transport};
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use transport::{listening::Listening, socket};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
 /// What the loopback pair agrees on: one bucket, one object put there, one
 /// credential in one region that the far end expects and the near end
 /// signs as.
+#[cfg(feature = "default")]
 const LOOPBACK_BUCKET: &str = "probe";
+#[cfg(feature = "default")]
 const LOOPBACK_OBJECT: &str = "probe.bin";
+#[cfg(feature = "default")]
 const LOOPBACK_REGION: &str = "eu-north-1";
+#[cfg(feature = "default")]
 const LOOPBACK_ACCESS_KEY: &str = "AKIDPROBE";
+#[cfg(feature = "default")]
 const LOOPBACK_SECRET_KEY: &str = "probe";
 
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct S3Transport {
     endpoint: String,
@@ -98,6 +124,7 @@ pub struct S3Transport {
     secret: Option<transport::Secured>,
 }
 
+#[cfg(feature = "default")]
 impl S3Transport {
     /// Speak to the endpoint at `endpoint` — `http://host:port` or
     /// `https://host:port` — in `region`, about `bucket`.
@@ -170,6 +197,7 @@ impl S3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for S3Transport {
     fn name(&self) -> &'static str {
         "aws-s3"
@@ -226,48 +254,10 @@ impl Transport for S3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for S3Transport {
-    /// The address is the S3 endpoint, `https://s3.<region>.amazonaws.com`.
-    /// The access key ID is `access_key_id`; its secret access key is the
-    /// Location's `secret`, never a setting.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "region",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The AWS region requests are signed for, eu-north-1.",
-                applies: Applies::Both,
-            },
-            aws::access_key::ACCESS_KEY_ID,
-            Setting {
-                name: "bucket",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The bucket objects are taken from, and put in when a send target \
-                          names none.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "prefix",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The key prefix a Receive Location takes objects under, in/; the \
-                          whole bucket when left out.",
-                applies: Applies::Receive,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long an endpoint that stops answering is waited on; unbounded \
-                 when left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["aws-s3"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.timeout)
@@ -315,11 +305,13 @@ impl Configured for S3Transport {
 /// above: `aws-s3://bucket/key`. The one place the form is written: the
 /// transport's receive, the session's answers and the aws-s3 archive's
 /// receipt all name an object by it.
+#[cfg(feature = "default")]
 #[must_use]
 pub fn origin(bucket: &str, key: &str) -> String {
     format!("aws-s3://{bucket}/{key}")
 }
 
+#[cfg(feature = "default")]
 impl S3Transport {
     /// Both ends on this machine: an ephemeral local port, one credential
     /// the far end expects and the near end signs as, the loopback timeout.
@@ -331,6 +323,7 @@ impl S3Transport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for S3Transport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
@@ -373,6 +366,7 @@ mod tests {
     use std::assert_matches;
     use std::thread::JoinHandle;
     use transport::Taken;
+    use xcore::settings::Applies;
 
     fn node(endpoint: &str, secret: &str) -> S3Transport {
         S3Transport::new(endpoint, "eu-north-1", "orders")
