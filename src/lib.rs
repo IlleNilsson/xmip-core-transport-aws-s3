@@ -34,11 +34,9 @@
 //! receive claims each object it hands over by putting `<key>.xmip-claim`
 //! beside it with `If-None-Match: *`, which S3 stores only where no object
 //! of the key exists, `412 Precondition Failed` otherwise — the capability's
-//! claim, written once (`transport::listed::Claims`). The claim holds the
-//! node's location and the time; it is deleted as it was put however the
-//! cycle ends, and a node that starts again deletes every claim its name
-//! still holds. [`Transport::claims`] answers the same claim for one object
-//! by its address. On an S3-compatible endpoint that ignores
+//! claim, written once (`transport::listed::Claims`).
+//! [`Transport::claims`] answers the same claim for one object by its
+//! address. On an S3-compatible endpoint that ignores
 //! `If-None-Match: *` every claim's put succeeds, so two nodes may both
 //! receive one object there: twice, never lost (open problem 75).
 //!
@@ -47,9 +45,7 @@
 //! the same form, or a key alone in this transport's bucket.
 //!
 //! **Built with its `declaration` feature alone** the crate is
-//! [`declaration`], what a Location of it is configured with, and none of
-//! the code above, which is behind the default feature: what the surfaces'
-//! library carries (ADR-0064, amendment 2026-11-26).
+//! [`declaration`].
 
 #[cfg(feature = "default")]
 pub mod bucket;
@@ -215,24 +211,10 @@ impl Transport for S3Transport {
         transport::Waiting::Polled("a receive lists the bucket and returns")
     }
 
-    /// Every object under the prefix that this node's claim wins, listed
-    /// by the capability's one object-store receive
-    /// ([`transport::listed::Claims::listed`]): each claimed by a put of
-    /// its claim with `If-None-Match: *`, one passed over where another's
-    /// claim lies. The receive gets and deletes nothing, each object's
-    /// `GET` is made when the runtime first reads its body — whole,
-    /// `net::http` reads a `GET` body whole — and its acknowledgement
-    /// deletes it on [`transport::Verdict::Accepted`] only. Both hold to the
-    /// `ETag` the listing gave (`If-Match`): a body written again since is
-    /// not read, its cycle fails and the next listing takes it as a new
-    /// arrival; an accepted object written again or deleted since is done
-    /// with, and what lies there now stays for the next listing. On
-    /// [`transport::Verdict::Refused`] it is left where it lies and this
-    /// Location does not receive it again while its `ETag` is unchanged —
-    /// one written again is a new arrival; the memory is the node
-    /// process's, so a node started again receives it once more. On
-    /// [`transport::Verdict::Failed`] it is left for the next receive to
-    /// list and get again. Whatever the verdict, its claim is deleted.
+    /// What [`transport::listed::Claims::listed`] wins under the prefix, each
+    /// object's claim put with `If-None-Match: *`, its get and its delete
+    /// held to the `ETag` the listing gave (`If-Match`); a `GET` body is read
+    /// whole by `net::http`.
     fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         self.claims.listed(&self.bucket()?, most)
     }
